@@ -5,15 +5,34 @@ import kotlinx.atomicfu.locks.SynchronizedObject.Status.*
 import kotlinx.cinterop.UnsafeNumber
 import kotlin.concurrent.AtomicReference
 
+var greeted = false
+
+var verboseMode = false
+
+expect fun getCurrentThreadQoS(): String
+
 @OptIn(UnsafeNumber::class) // required for KT-60572
 public actual open class SynchronizedObject {
+
+    init {
+        if (!greeted) {
+            println("Hello from native SynchronizedObject implementation")
+            greeted = true
+        }
+    }
 
     protected val lock = AtomicReference(LockState(UNLOCKED, 0, 0))
 
     public fun lock() {
         val currentThreadId = pthread_self()!!
+        var spinCount = 0
         while (true) {
             val state = lock.value
+
+            if (verboseMode && spinCount == 0) {
+                println("!!!VERBOSE lock enter:  ${state.status.name}, qos: ${getCurrentThreadQoS()}, curThread: ${currentThreadId}, owner: ${state.ownerThreadId}, $this")
+            }
+
             when (state.status) {
                 UNLOCKED -> {
                     val thinLock = LockState(THIN, 1, 0, currentThreadId)
@@ -62,6 +81,19 @@ public actual open class SynchronizedObject {
                     }
                 }
             }
+
+            if (spinCount < 10) {
+                println("Spin looping on lock: ${state.status.name}, qos: ${getCurrentThreadQoS()}, curThread: ${currentThreadId}, owner: ${state.ownerThreadId}, $this")
+            } else if (spinCount == 10) {
+                println("!! Spin looping on lock >10: ${state.status.name}, qos: ${getCurrentThreadQoS()}, curThread: ${currentThreadId}, owner: ${state.ownerThreadId}, $this")
+            } else if (spinCount > 1000){
+                val qos = getCurrentThreadQoS()
+                if (!verboseMode && qos == "User Interactive") {
+                    println("!!!VERBOSE MODE enabled: Spin looping: ${state.status.name}, qos: $qos, curThread: ${currentThreadId}, owner: ${state.ownerThreadId}, $this")
+                    verboseMode = true
+                }
+            }
+            spinCount++
         }
     }
 
@@ -88,8 +120,15 @@ public actual open class SynchronizedObject {
 
     public fun unlock() {
         val currentThreadId = pthread_self()!!
+        var spinCount = 0
+
         while (true) {
             val state = lock.value
+
+            if (verboseMode && spinCount == 0) {
+                println("!!!VERBOSE unlock enter:  ${state.status.name}, qos: ${getCurrentThreadQoS()}, curThread: ${currentThreadId}, owner: ${state.ownerThreadId}, $this")
+            }
+
             require(currentThreadId == state.ownerThreadId) { "Thin lock may be only released by the owner thread, expected: ${state.ownerThreadId}, real: $currentThreadId" }
             when (state.status) {
                 THIN -> {
@@ -125,12 +164,20 @@ public actual open class SynchronizedObject {
 
                 else -> error("It is not possible to unlock the mutex that is not obtained")
             }
+            if (spinCount < 10) {
+                println("Spin looping on unlock: ${state.status.name}, qos: ${getCurrentThreadQoS()}, curThread: ${currentThreadId}, owner: ${state.ownerThreadId}, $this")
+            }
+            spinCount++
         }
     }
 
     private fun tryLockAfterResume(threadId: pthread_t) {
         while (true) {
             val state = lock.value
+            if (verboseMode) {
+                val currentThreadId = pthread_self()!!
+                println("!!!VERBOSE tryLockAfterResume:  ${state.status.name}, qos: ${getCurrentThreadQoS()}, curThread: ${currentThreadId}, owner: ${state.ownerThreadId}, $this")
+            }
             val newState = if (state.waiters == 0) // deflate
                 LockState(THIN, 1, 0, threadId)
             else
@@ -175,6 +222,10 @@ public actual inline fun <T> synchronized(lock: SynchronizedObject, block: () ->
         return block()
     } finally {
         lock.unlock()
+        if (verboseMode) {
+            val currentThreadId = pthread_self()!!
+            println("!!!VERBOSE AFTER unlock:  qos: ${getCurrentThreadQoS()}, curThread: ${currentThreadId}, $lock")
+        }
     }
 }
 
