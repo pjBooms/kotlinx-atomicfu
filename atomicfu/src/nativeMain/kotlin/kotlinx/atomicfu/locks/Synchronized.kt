@@ -100,6 +100,11 @@ public actual open class SynchronizedObject {
         } finally {
             if (spinCount > 10) {
                 println("!!total spin count: ${spinCount}, qos: ${getCurrentThreadQoS()}, curThread: ${currentThreadId}, $this")
+                val qos = getCurrentThreadQoS()
+                if (verboseMode && qos == "User Interactive") {
+                    println("!!!VERBOSE MODE disabled")
+                    verboseMode = false
+                }
             }
         }
     }
