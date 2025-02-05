@@ -26,74 +26,81 @@ public actual open class SynchronizedObject {
     public fun lock() {
         val currentThreadId = pthread_self()!!
         var spinCount = 0
-        while (true) {
-            val state = lock.value
+        try {
+            while (true) {
+                val state = lock.value
 
-            if (verboseMode && spinCount == 0) {
-                println("!!!VERBOSE lock enter:  ${state.status.name}, qos: ${getCurrentThreadQoS()}, curThread: ${currentThreadId}, owner: ${state.ownerThreadId}, $this")
-            }
-
-            when (state.status) {
-                UNLOCKED -> {
-                    val thinLock = LockState(THIN, 1, 0, currentThreadId)
-                    if (lock.compareAndSet(state, thinLock))
-                        return
+                if (verboseMode && spinCount == 0) {
+                    println("!!!VERBOSE lock enter:  ${state.status.name}, qos: ${getCurrentThreadQoS()}, curThread: ${currentThreadId}, owner: ${state.ownerThreadId}, $this")
                 }
 
-                THIN -> {
-                    if (currentThreadId == state.ownerThreadId) {
-                        // reentrant lock
-                        val thinNested = LockState(THIN, state.nestedLocks + 1, state.waiters, currentThreadId)
-                        if (lock.compareAndSet(state, thinNested))
+                when (state.status) {
+                    UNLOCKED -> {
+                        val thinLock = LockState(THIN, 1, 0, currentThreadId)
+                        if (lock.compareAndSet(state, thinLock))
                             return
-                    } else {
-                        // another thread is trying to take this lock -> allocate native mutex
-                        val mutex = mutexPool.allocate()
-                        mutex.lock()
-                        val fatLock = LockState(FAT, state.nestedLocks, state.waiters + 1, state.ownerThreadId, mutex)
-                        if (lock.compareAndSet(state, fatLock)) {
-                            //block the current thread waiting for the owner thread to release the permit
-                            mutex.lock()
-                            tryLockAfterResume(currentThreadId)
-                            return
+                    }
+
+                    THIN -> {
+                        if (currentThreadId == state.ownerThreadId) {
+                            // reentrant lock
+                            val thinNested = LockState(THIN, state.nestedLocks + 1, state.waiters, currentThreadId)
+                            if (lock.compareAndSet(state, thinNested))
+                                return
                         } else {
-                            // return permit taken for the owner thread and release mutex back to the pool
-                            mutex.unlock()
-                            mutexPool.release(mutex)
+                            // another thread is trying to take this lock -> allocate native mutex
+                            val mutex = mutexPool.allocate()
+                            mutex.lock()
+                            val fatLock =
+                                LockState(FAT, state.nestedLocks, state.waiters + 1, state.ownerThreadId, mutex)
+                            if (lock.compareAndSet(state, fatLock)) {
+                                //block the current thread waiting for the owner thread to release the permit
+                                mutex.lock()
+                                tryLockAfterResume(currentThreadId)
+                                return
+                            } else {
+                                // return permit taken for the owner thread and release mutex back to the pool
+                                mutex.unlock()
+                                mutexPool.release(mutex)
+                            }
+                        }
+                    }
+
+                    FAT -> {
+                        if (currentThreadId == state.ownerThreadId) {
+                            // reentrant lock
+                            val nestedFatLock =
+                                LockState(FAT, state.nestedLocks + 1, state.waiters, state.ownerThreadId, state.mutex)
+                            if (lock.compareAndSet(state, nestedFatLock)) return
+                        } else if (state.ownerThreadId != null) {
+                            val fatLock =
+                                LockState(FAT, state.nestedLocks, state.waiters + 1, state.ownerThreadId, state.mutex)
+                            if (lock.compareAndSet(state, fatLock)) {
+                                fatLock.mutex!!.lock()
+                                tryLockAfterResume(currentThreadId)
+                                return
+                            }
                         }
                     }
                 }
 
-                FAT -> {
-                    if (currentThreadId == state.ownerThreadId) {
-                        // reentrant lock
-                        val nestedFatLock =
-                            LockState(FAT, state.nestedLocks + 1, state.waiters, state.ownerThreadId, state.mutex)
-                        if (lock.compareAndSet(state, nestedFatLock)) return
-                    } else if (state.ownerThreadId != null) {
-                        val fatLock =
-                            LockState(FAT, state.nestedLocks, state.waiters + 1, state.ownerThreadId, state.mutex)
-                        if (lock.compareAndSet(state, fatLock)) {
-                            fatLock.mutex!!.lock()
-                            tryLockAfterResume(currentThreadId)
-                            return
-                        }
+                if (spinCount < 10) {
+                    println("Spin looping on lock: ${state.status.name}, qos: ${getCurrentThreadQoS()}, curThread: ${currentThreadId}, owner: ${state.ownerThreadId}, $this")
+                } else if (spinCount == 10) {
+                    println("!! Spin looping on lock >10: ${state.status.name}, qos: ${getCurrentThreadQoS()}, curThread: ${currentThreadId}, owner: ${state.ownerThreadId}, $this")
+                } else if (spinCount > 1000) {
+                    val qos = getCurrentThreadQoS()
+                    if (!verboseMode && qos == "User Interactive") {
+                        println("!!!VERBOSE MODE enabled: Spin looping: ${state.status.name}, qos: $qos, curThread: ${currentThreadId}, owner: ${state.ownerThreadId}, $this")
+                        verboseMode = true
                     }
                 }
+                spinCount++
             }
-
-            if (spinCount < 10) {
-                println("Spin looping on lock: ${state.status.name}, qos: ${getCurrentThreadQoS()}, curThread: ${currentThreadId}, owner: ${state.ownerThreadId}, $this")
-            } else if (spinCount == 10) {
-                println("!! Spin looping on lock >10: ${state.status.name}, qos: ${getCurrentThreadQoS()}, curThread: ${currentThreadId}, owner: ${state.ownerThreadId}, $this")
-            } else if (spinCount > 1000){
-                val qos = getCurrentThreadQoS()
-                if (!verboseMode && qos == "User Interactive") {
-                    println("!!!VERBOSE MODE enabled: Spin looping: ${state.status.name}, qos: $qos, curThread: ${currentThreadId}, owner: ${state.ownerThreadId}, $this")
-                    verboseMode = true
-                }
+        } finally {
+            if (spinCount > 10) {
+                println("!!total spin count: ${spinCount}, qos: ${getCurrentThreadQoS()}, curThread: ${currentThreadId}, $this")
             }
-            spinCount++
         }
     }
 
